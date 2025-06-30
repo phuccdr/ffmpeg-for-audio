@@ -17,6 +17,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -29,19 +30,30 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.android.demo_ffmpeg.ui.theme.Demo_ffmpegTheme
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.random.Random
 
 class TrimAudioActivity : ComponentActivity() {
     private val viewModel: TrimAudioViewModel by viewModels()
@@ -60,7 +72,7 @@ class TrimAudioActivity : ComponentActivity() {
             }
         }
     }
-    
+
     override fun onDestroy() {
         super.onDestroy()
         viewModel.stopPlayback()
@@ -75,43 +87,53 @@ fun TrimAudioScreen(
     val context = LocalContext.current
     val state by viewModel.state.collectAsStateWithLifecycle()
     val coroutineScope = rememberCoroutineScope()
-    
+
     // Permission launcher
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         if (!isGranted) {
-            Toast.makeText(context, "Cần quyền truy cập file để chọn audio", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Cần quyền truy cập file để chọn audio", Toast.LENGTH_SHORT)
+                .show()
         }
     }
-    
+
     // File picker launcher
     val audioLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         uri?.let { viewModel.setAudioPath(it, context) }
     }
-    
+
     // Check permission function
     fun checkPermissionAndPickFile() {
         when {
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
                 // For Android 13+ use READ_MEDIA_AUDIO permission
-                when (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_AUDIO)) {
+                when (ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.READ_MEDIA_AUDIO
+                )) {
                     PackageManager.PERMISSION_GRANTED -> {
                         audioLauncher.launch("audio/*")
                     }
+
                     else -> {
                         permissionLauncher.launch(Manifest.permission.READ_MEDIA_AUDIO)
                     }
                 }
             }
+
             else -> {
                 // For older versions use READ_EXTERNAL_STORAGE
-                when (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_EXTERNAL_STORAGE)) {
+                when (ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.READ_EXTERNAL_STORAGE
+                )) {
                     PackageManager.PERMISSION_GRANTED -> {
                         audioLauncher.launch("audio/*")
                     }
+
                     else -> {
                         permissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
                     }
@@ -119,7 +141,7 @@ fun TrimAudioScreen(
             }
         }
     }
-    
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -157,18 +179,18 @@ fun TrimAudioScreen(
                 )
             }
         }
-        
+
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         // File selection card
         AudioFileSelectionCard(
             hasFile = state.audioPath != null,
             onClick = { checkPermissionAndPickFile() },
             modifier = Modifier.fillMaxWidth()
         )
-        
+
         Spacer(modifier = Modifier.height(24.dp))
-        
+
         // Audio waveform and range slider
         if (state.audioPath != null) {
             AudioTrimControls(
@@ -177,7 +199,7 @@ fun TrimAudioScreen(
                 endTimeMs = state.endTimeMs,
                 currentPosition = state.currentPlaybackPosition,
                 isPlaying = state.isPlaying,
-                onRangeChange = { start, end -> 
+                onRangeChange = { start, end ->
                     viewModel.setTimeRange(start, end)
                 },
                 onPlayPause = {
@@ -188,11 +210,12 @@ fun TrimAudioScreen(
                     }
                 },
                 formatTime = { ms -> viewModel.formatMillisecondsToTimeString(ms.toLong()) },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                audioAmplitudes = state.floatListSample
             )
-            
+
             Spacer(modifier = Modifier.height(16.dp))
-            
+
             // Time selection section
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -207,7 +230,7 @@ fun TrimAudioScreen(
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(bottom = 16.dp)
                     )
-                    
+
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(16.dp)
@@ -219,7 +242,7 @@ fun TrimAudioScreen(
                             onValueChange = { viewModel.setStartTime(it) },
                             modifier = Modifier.weight(1f)
                         )
-                        
+
                         // End time
                         TimeInputField(
                             label = "Kết thúc",
@@ -228,9 +251,9 @@ fun TrimAudioScreen(
                             modifier = Modifier.weight(1f)
                         )
                     }
-                    
+
                     Spacer(modifier = Modifier.height(12.dp))
-                    
+
                     // Duration info
                     val duration = calculateDuration(state.startTime, state.endTime)
                     if (duration > 0) {
@@ -243,10 +266,10 @@ fun TrimAudioScreen(
                     }
                 }
             }
-            
+
             Spacer(modifier = Modifier.height(16.dp))
         }
-        
+
         // Progress section
         if (state.isProcessing || state.progress.isNotEmpty()) {
             Card(
@@ -273,7 +296,7 @@ fun TrimAudioScreen(
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
-        
+
         // Error message
         if (state.error != null) {
             Card(
@@ -292,7 +315,7 @@ fun TrimAudioScreen(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = state.error?:"",
+                        text = state.error ?: "",
                         color = Color(0xFFD32F2F),
                         fontSize = 14.sp
                     )
@@ -300,7 +323,7 @@ fun TrimAudioScreen(
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
-        
+
         // Success message with output path
         if (state.outputFilePath != null && !state.isProcessing) {
             Card(
@@ -332,16 +355,16 @@ fun TrimAudioScreen(
                         fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurface
                     )
-                    
+
                     // Display technical path info (hidden in production apps)
                     Text(
                         text = "Đường dẫn: ${state.outputFilePath}",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                     )
-                    
+
                     Spacer(modifier = Modifier.height(12.dp))
-                    
+
                     // Button to open the file
                     Button(
                         onClick = {
@@ -363,11 +386,19 @@ fun TrimAudioScreen(
                                         }
                                         context.startActivity(intent)
                                     } else {
-                                        Toast.makeText(context, "Không thể mở file", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(
+                                            context,
+                                            "Không thể mở file",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
                                     }
                                 }
                             } catch (e: Exception) {
-                                Toast.makeText(context, "Lỗi khi mở file: ${e.message}", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(
+                                    context,
+                                    "Lỗi khi mở file: ${e.message}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
                             }
                         },
                         modifier = Modifier.fillMaxWidth(),
@@ -385,9 +416,9 @@ fun TrimAudioScreen(
             }
             Spacer(modifier = Modifier.height(16.dp))
         }
-        
+
         Spacer(modifier = Modifier.weight(1f))
-        
+
         // Action buttons
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -395,7 +426,7 @@ fun TrimAudioScreen(
         ) {
             if (state.audioPath != null) {
                 OutlinedButton(
-                    onClick = { 
+                    onClick = {
                         viewModel.resetState()
                         viewModel.clearError()
                     },
@@ -411,7 +442,7 @@ fun TrimAudioScreen(
                     Text("Làm mới")
                 }
             }
-            
+
             Button(
                 onClick = { viewModel.trimAudio(context) },
                 modifier = Modifier.weight(1f),
@@ -436,7 +467,7 @@ fun TrimAudioScreen(
             }
         }
     }
-    
+
     // Clear error when it's shown
     LaunchedEffect(state.error) {
         if (state.error != null) {
@@ -456,11 +487,12 @@ fun AudioTrimControls(
     onRangeChange: (Float, Float) -> Unit,
     onPlayPause: () -> Unit,
     formatTime: (Float) -> String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    audioAmplitudes: List<Float>
 ) {
     val primaryColor = Color(0xFF4CAF50)
     val secondaryColor = Color(0xFF4CAF50).copy(alpha = 0.3f)
-    
+
     Card(
         modifier = modifier,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -480,82 +512,35 @@ fun AudioTrimControls(
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurface
                 )
-                
+
                 Text(
                     text = formatTime(endTimeMs),
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurface
                 )
             }
-            
-            // Audio waveform visualization placeholder
+
+            // Improved audio waveform with clear handles
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(60.dp)
+                    .height(100.dp) // Tăng chiều cao để dễ thao tác hơn
                     .clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
             ) {
-                // Audio waveform visualization (simplified for the demo)
-                AudioWaveformVisualization(
+                ImprovedAudioWaveform(
                     modifier = Modifier.matchParentSize(),
                     startPercent = startTimeMs / audioDuration,
                     endPercent = endTimeMs / audioDuration,
-                    currentPositionPercent = currentPosition / audioDuration,
                     primaryColor = primaryColor,
-                    secondaryColor = secondaryColor
+                    secondaryColor = secondaryColor,
+                    audioAmplitudes = audioAmplitudes,
+                    currentPosition = if (isPlaying) currentPosition / audioDuration else null,
+                    onRangeChange = onRangeChange,
+                    audioDuration = audioDuration
                 )
-                
-                // Start handle
-                AudioTrimHandle(
-                    position = startTimeMs / audioDuration,
-                    color = primaryColor,
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .width(8.dp)
-                )
-                
-                // End handle
-                AudioTrimHandle(
-                    position = endTimeMs / audioDuration,
-                    color = primaryColor,
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .width(8.dp)
-                )
-                
-                // Playback position indicator
-                if (isPlaying) {
-                    Box(
-                        modifier = Modifier
-                            .offset(x = (currentPosition / audioDuration * 100).dp)
-                            .width(2.dp)
-                            .fillMaxHeight()
-                            .background(Color.Red)
-                    )
-                }
             }
-            
-            // Custom range slider
-            RangeSlider(
-                value = startTimeMs / audioDuration..endTimeMs / audioDuration,
-                onValueChange = { range ->
-                    val newStart = (range.start * audioDuration).coerceAtLeast(0f)
-                    val newEnd = (range.endInclusive * audioDuration).coerceAtMost(audioDuration)
-                    onRangeChange(newStart, newEnd)
-                },
-                valueRange = 0f..1f,
-                steps = 100,
-                colors = SliderDefaults.colors(
-                    thumbColor = primaryColor,
-                    activeTrackColor = primaryColor,
-                    inactiveTrackColor = secondaryColor
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = 16.dp)
-            )
-            
+
             // Play button and current position
             Row(
                 modifier = Modifier
@@ -570,7 +555,7 @@ fun AudioTrimControls(
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                 )
-                
+
                 // Play/Pause button
                 FilledIconButton(
                     onClick = onPlayPause,
@@ -588,78 +573,130 @@ fun AudioTrimControls(
 }
 
 @Composable
-fun AudioWaveformVisualization(
-    modifier: Modifier = Modifier,
+fun ImprovedAudioWaveform(
+    audioAmplitudes: List<Float>,
+    modifier: Modifier,
     startPercent: Float,
     endPercent: Float,
-    currentPositionPercent: Float,
     primaryColor: Color,
-    secondaryColor: Color
+    secondaryColor: Color,
+    currentPosition: Float?,
+    onRangeChange: (Float, Float) -> Unit,
+    audioDuration: Float
 ) {
-    Canvas(modifier = modifier) {
+    val density = LocalDensity.current
+    var isDraggingLeft by remember { mutableStateOf(false) }
+    var isDraggingRight by remember { mutableStateOf(false) }
+    
+    // Kích thước của handle để kéo
+    val handleWidth = with(density) { 20.dp.toPx() }
+    val handleHeight = with(density) { 40.dp.toPx() }
+
+    Canvas(
+        modifier = modifier
+            .clipToBounds()
+            .pointerInput(Unit) {
+                detectDragGestures(
+                    onDragStart = { offset ->
+                        // Xác định xem người dùng đang kéo handle nào
+                        val width = size.width
+                        val leftHandleX = startPercent * width
+                        val rightHandleX = endPercent * width
+                        
+                        isDraggingLeft = abs(offset.x - leftHandleX) <= handleWidth
+                        isDraggingRight = !isDraggingLeft && abs(offset.x - rightHandleX) <= handleWidth
+                    },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        val width = size.width
+                        val dragX = dragAmount.x / width
+                        
+                        when {
+                            isDraggingLeft -> {
+                                val newStartPercent = (startPercent + dragX).coerceIn(0f, endPercent - 0.05f)
+                                onRangeChange(newStartPercent * audioDuration, endPercent * audioDuration)
+                            }
+                            isDraggingRight -> {
+                                val newEndPercent = (endPercent + dragX).coerceIn(startPercent + 0.05f, 1f)
+                                onRangeChange(startPercent * audioDuration, newEndPercent * audioDuration)
+                            }
+                        }
+                    },
+                    onDragEnd = {
+                        isDraggingLeft = false
+                        isDraggingRight = false
+                    }
+                )
+            }
+    ) {
         val width = size.width
         val height = size.height
+        val centerY = height / 2
         
-        // Draw background for non-selected region
-        drawRect(
-            color = Color.Gray.copy(alpha = 0.2f),
-            size = size
-        )
+        // Số lượng thanh hiển thị dựa vào kích thước màn hình
+        val barCount = min(audioAmplitudes.size, (width / 5).toInt())
+        val barSpacing = 1.dp.toPx()
+        val barWidth = (width / barCount) - barSpacing
         
-        // Draw selected region background
+        // Vẽ background cho khu vực chọn
         drawRect(
-            color = primaryColor.copy(alpha = 0.2f),
+            color = primaryColor.copy(alpha = 0.15f),
             topLeft = Offset(startPercent * width, 0f),
-            size = androidx.compose.ui.geometry.Size(
-                (endPercent - startPercent) * width,
-                height
-            )
+            size = Size((endPercent - startPercent) * width, height)
         )
         
-        // Draw waveform bars
-        val barCount = 60
-        val barWidth = width / barCount
-        val random = java.util.Random(0) // Use fixed seed for consistent visualization
-        
+        // Vẽ waveform
         for (i in 0 until barCount) {
-            val x = i * barWidth
-            val barHeightPercent = 0.1f + random.nextFloat() * 0.8f // Random height between 10-90%
-            val barHeight = height * barHeightPercent
-            
-            val barColor = when {
-                x / width in startPercent..endPercent -> primaryColor
-                else -> secondaryColor
-            }
-            
-            // Draw bar
+            val amplitude = if (i < audioAmplitudes.size) audioAmplitudes[i] else 0.1f
+            val x = i * (barWidth + barSpacing)
+            val barHeight = amplitude * height * 0.7f // Chiều cao tối đa 70% chiều cao canvas
+
+            val percent = i.toFloat() / barCount
+            val color = if (percent in startPercent..endPercent) primaryColor else secondaryColor
+
             drawRect(
-                color = barColor,
-                topLeft = Offset(x + barWidth * 0.1f, (height - barHeight) / 2),
-                size = androidx.compose.ui.geometry.Size(barWidth * 0.8f, barHeight)
+                color = color,
+                topLeft = Offset(x, centerY - barHeight / 2),
+                size = Size(barWidth, barHeight)
             )
         }
-    }
-}
-
-@Composable
-fun AudioTrimHandle(
-    position: Float,
-    color: Color,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .fillMaxHeight()
-            .offset(
-                x = (position * LocalContext.current.resources.displayMetrics.density * 100).dp
-            )
-    ) {
-        Box(
-            modifier = Modifier
-                .fillMaxHeight()
-                .width(8.dp)
-                .background(color)
+        
+        // Vẽ handle trái
+        drawRect(
+            color = primaryColor,
+            topLeft = Offset(startPercent * width - handleWidth/2, centerY - handleHeight/2),
+            size = Size(handleWidth, handleHeight),
+            style = Stroke(width = 2.dp.toPx())
         )
+        drawRect(
+            color = primaryColor.copy(alpha = 0.3f),
+            topLeft = Offset(startPercent * width - handleWidth/2, centerY - handleHeight/2),
+            size = Size(handleWidth, handleHeight)
+        )
+        
+        // Vẽ handle phải
+        drawRect(
+            color = primaryColor,
+            topLeft = Offset(endPercent * width - handleWidth/2, centerY - handleHeight/2),
+            size = Size(handleWidth, handleHeight),
+            style = Stroke(width = 2.dp.toPx())
+        )
+        drawRect(
+            color = primaryColor.copy(alpha = 0.3f),
+            topLeft = Offset(endPercent * width - handleWidth/2, centerY - handleHeight/2),
+            size = Size(handleWidth, handleHeight)
+        )
+        
+        // Vẽ vị trí hiện tại nếu đang phát
+        currentPosition?.let {
+            val posX = it * width
+            drawLine(
+                color = Color.Red,
+                start = Offset(posX, 0f),
+                end = Offset(posX, height),
+                strokeWidth = 2.dp.toPx()
+            )
+        }
     }
 }
 
@@ -678,9 +715,9 @@ fun AudioFileSelectionCard(
                 shape = RoundedCornerShape(12.dp)
             ),
         colors = CardDefaults.cardColors(
-            containerColor = if (hasFile) 
-                Color(0xFF4CAF50).copy(alpha = 0.1f) 
-            else 
+            containerColor = if (hasFile)
+                Color(0xFF4CAF50).copy(alpha = 0.1f)
+            else
                 MaterialTheme.colorScheme.surface
         ),
         shape = RoundedCornerShape(12.dp)
@@ -705,9 +742,9 @@ fun AudioFileSelectionCard(
                     modifier = Modifier.size(24.dp)
                 )
             }
-            
+
             Spacer(modifier = Modifier.width(12.dp))
-            
+
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "File Audio",
@@ -717,13 +754,13 @@ fun AudioFileSelectionCard(
                 Text(
                     text = if (hasFile) "✓ Đã chọn file" else "Chọn file audio để cắt",
                     fontSize = 14.sp,
-                    color = if (hasFile) 
-                        Color(0xFF4CAF50) 
-                    else 
+                    color = if (hasFile)
+                        Color(0xFF4CAF50)
+                    else
                         MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                 )
             }
-            
+
             Icon(
                 imageVector = Icons.Filled.ChevronRight,
                 contentDescription = "Select",
@@ -733,7 +770,6 @@ fun AudioFileSelectionCard(
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TimeInputField(
     label: String,
@@ -772,8 +808,14 @@ fun calculateDuration(startTime: String, endTime: String): Int {
             0
         }
     }
-    
+
     val startSeconds = timeToSeconds(startTime)
     val endSeconds = timeToSeconds(endTime)
     return maxOf(0, endSeconds - startSeconds)
 }
+
+
+
+
+
+
