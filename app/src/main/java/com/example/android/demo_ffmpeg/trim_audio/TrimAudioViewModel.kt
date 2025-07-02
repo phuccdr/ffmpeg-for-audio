@@ -71,9 +71,9 @@ class TrimAudioViewModel : ViewModel() {
                 val duration = withContext(Dispatchers.IO) {
                     getAudioDuration(uri, context)
                 }
-                val floatList = withContext(Dispatchers.IO) {
-                    generateWaveformData(uri, context, WAVEFORM_SAMPLE_COUNT)
-                }
+//                val floatList = withContext(Dispatchers.IO) {
+//                    generateWaveformData(uri, context, WAVEFORM_SAMPLE_COUNT)
+//                }
 
                 val defaultEndTimeMs = minOf(30000f, duration.toFloat())
 
@@ -84,7 +84,7 @@ class TrimAudioViewModel : ViewModel() {
                     endTimeMs = defaultEndTimeMs,
                     startTime = formatMillisecondsToTimeString(0),
                     endTime = formatMillisecondsToTimeString(defaultEndTimeMs.toLong()),
-                    floatListSample = floatList
+//                    floatListSample = floatList
                 )
             } catch (e: Exception) {
                 _state.value = _state.value.copy(

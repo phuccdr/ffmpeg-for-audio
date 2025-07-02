@@ -25,6 +25,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {
@@ -75,5 +76,8 @@ dependencies {
     implementation ("androidx.compose.material:material-icons-extended:1.6.0")
     //lifecycle for compose
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.6.0")
+
+    implementation ("com.github.lincollincol:compose-audiowaveform:1.1.1")
+    implementation ("com.github.lincollincol:amplituda:2.3.0")
 
 }
