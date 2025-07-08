@@ -2,8 +2,6 @@ package com.example.android.demo_ffmpeg.trim_audio
 
 import android.content.ContentValues
 import android.content.Context
-import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.media.MediaScannerConnection
@@ -12,42 +10,34 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
-import androidx.collection.emptyFloatList
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
+import com.example.android.demo_ffmpeg.util.AudioFileInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.nio.ByteBuffer
 import kotlin.math.abs
-import kotlin.math.max
-import kotlin.math.min
 
 data class AudioTrimState(
-    val audioPath: Uri? = null,
-    val startTime: String = "00:00",
-    val endTime: String = "00:30",
     val isProcessing: Boolean = false,
     val progress: String = "",
     val outputFilePath: String? = null,
     val outputUri: Uri? = null,
     val error: String? = null,
-    val audioDuration: Int = 0,
-    val startTimeMs: Float = 0f,
-    val endTimeMs: Float = 30000f,
     val isPlaying: Boolean = false,
     val currentPlaybackPosition: Float = 0f,
-    val playerProgress: Float = 0f,
-    val floatListSample: List<Float> = emptyList()
+    var playerProgress: Float = 0f,
+    var audioInfo: AudioFileInfo? = null,
+    var amplitude: List<Int> = emptyList(),
+    var currentPlayAudioPosition: Float = 0f
 )
 
 class TrimAudioViewModel : ViewModel() {
@@ -59,35 +49,67 @@ class TrimAudioViewModel : ViewModel() {
 
     companion object {
         private const val TAG = "TrimAudioViewModel"
-        private const val WAVEFORM_SAMPLE_COUNT = 100 // Số lượng mẫu cho waveform
+        private const val SAMPLES_PER_SECOND = 10 // 10 điểm sample per giây
+        private const val MAX_SAMPLES_FOR_LARGE_FILES = 500 // Giới hạn cho file lớn
+        private const val LARGE_FILE_SIZE_THRESHOLD = 50 * 1024 * 1024 // 50MB
+        private const val BUFFER_SIZE_SMALL = 32 * 1024 // 32KB cho file nhỏ
+        private const val BUFFER_SIZE_LARGE = 128 * 1024 // 128KB cho file lớn
+        private const val EXTREME_FILE_SIZE_THRESHOLD = 100 * 1024 * 1024 // 100MB - file cực lớn
+        private const val MIN_SAMPLES_FOR_EXTREME_FILES = 100 // Tối thiểu cho file cực lớn
     }
 
-    fun setAudioPath(uri: Uri, context: Context) {
-        stopPlayback()
-
+    fun getAudioFileInfo(uri: Uri, context: Context) {
+        resetState()
         viewModelScope.launch {
             try {
-                // Extract audio duration
-                val duration = withContext(Dispatchers.IO) {
-                    getAudioDuration(uri, context)
-                }
-//                val floatList = withContext(Dispatchers.IO) {
-//                    generateWaveformData(uri, context, WAVEFORM_SAMPLE_COUNT)
-//                }
-
-                val defaultEndTimeMs = minOf(30000f, duration.toFloat())
-
                 _state.value = _state.value.copy(
-                    audioPath = uri,
-                    audioDuration = duration,
-                    startTimeMs = 0f,
-                    endTimeMs = defaultEndTimeMs,
-                    startTime = formatMillisecondsToTimeString(0),
-                    endTime = formatMillisecondsToTimeString(defaultEndTimeMs.toLong()),
-//                    floatListSample = floatList
+                    isProcessing = true,
+                    progress = "Đang đọc thông tin file audio..."
                 )
+                Log.d(TAG, "Reading audio file info...")
+                
+                // Lấy tên file từ URI
+                val fileName = getFileNameFromUri(uri, context)
+
+                // Lấy thời lượng audio
+                val duration = getAudioDuration(uri, context)
+
+                // Tính số sample dựa trên thời lượng và kích thước file
+                val durationInSeconds = (duration / 1000f).toInt()
+                val sampleCount = calculateOptimalSampleCount(durationInSeconds, uri, context)
+                
+                Log.d(TAG, "Audio duration: ${durationInSeconds}s, optimal sample count: $sampleCount")
+
+                // Tạo dữ liệu waveform
+                _state.value = _state.value.copy(progress = "Đang tạo waveform...")
+                val waveformData = generateWaveformData(uri, context, sampleCount)
+
+                // Tạo AudioFileInfo object với đầy đủ thông tin
+                val audioInfo = AudioFileInfo(
+                    name = fileName,
+                    startTime = 0f,
+                    endTime = duration,
+                    duration = duration,
+                    amplitude = waveformData,
+                    audioPath = uri,
+                    index = 0
+                )
+                Log.d(TAG, "Audio info loaded successfully: $audioInfo")
+
+                // Cập nhật state với AudioFileInfo
+                _state.value = _state.value.copy(
+                    isProcessing = false,
+                    progress = "Hoàn thành!",
+                    audioInfo = audioInfo,
+                    error = null
+                )
+
+                Log.d(TAG, "Audio info loaded successfully: $fileName, duration: ${duration}ms")
+
             } catch (e: Exception) {
                 _state.value = _state.value.copy(
+                    isProcessing = false,
+                    progress = "",
                     error = "Không thể đọc thông tin file audio: ${e.message}"
                 )
                 Log.e(TAG, "Error reading audio file", e)
@@ -96,103 +118,442 @@ class TrimAudioViewModel : ViewModel() {
     }
 
     /**
-     * Tạo dữ liệu waveform từ file audio phù hợp với nhiều định dạng
+     * Tính toán số sample tối ưu dựa trên thời lượng và kích thước file
+     * để tránh OutOfMemoryError với file lớn
+     */
+    private suspend fun calculateOptimalSampleCount(durationInSeconds: Int, uri: Uri, context: Context): Int {
+        return withContext(Dispatchers.IO) {
+            try {
+                // Ước tính kích thước file
+                val fileSize = getFileSize(uri, context)
+                
+                val baseSampleCount = durationInSeconds * SAMPLES_PER_SECOND
+                
+                // Điều chỉnh số sample cho file lớn
+                val optimalSampleCount = when {
+                    fileSize > EXTREME_FILE_SIZE_THRESHOLD -> {
+                        // File cực lớn (>100MB): giảm mạnh số sample
+                        val extremelySafeCount = minOf(baseSampleCount, MIN_SAMPLES_FOR_EXTREME_FILES)
+                        Log.d(TAG, "Extremely large file detected (${fileSize / 1024 / 1024}MB), using minimal samples: $extremelySafeCount")
+                        extremelySafeCount
+                    }
+                    fileSize > LARGE_FILE_SIZE_THRESHOLD -> {
+                        // File lớn: giảm density của sample
+                        val reducedSamples = minOf(baseSampleCount, MAX_SAMPLES_FOR_LARGE_FILES)
+                        Log.d(TAG, "Large file detected (${fileSize / 1024 / 1024}MB), reducing samples to $reducedSamples")
+                        reducedSamples
+                    }
+                    durationInSeconds > 300 -> {
+                        // File dài (>5 phút): giảm sample rate
+                        val reducedSamples = minOf(baseSampleCount, durationInSeconds * 5)
+                        Log.d(TAG, "Long duration file (${durationInSeconds}s), reducing samples to $reducedSamples")
+                        reducedSamples
+                    }
+                    else -> baseSampleCount
+                }
+                
+                Log.d(TAG, "File size: ${fileSize / 1024 / 1024}MB, duration: ${durationInSeconds}s, samples: $optimalSampleCount")
+                return@withContext optimalSampleCount
+                
+            } catch (e: Exception) {
+                Log.e(TAG, "Error calculating optimal sample count", e)
+                return@withContext durationInSeconds * SAMPLES_PER_SECOND
+            }
+        }
+    }
+
+    /**
+     * Lấy kích thước file từ URI
+     */
+    private fun getFileSize(uri: Uri, context: Context): Long {
+        return try {
+            val cursor = context.contentResolver.query(uri, null, null, null, null)
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val sizeIndex = it.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                    if (sizeIndex != -1) {
+                        return it.getLong(sizeIndex)
+                    }
+                }
+            }
+            // Fallback: estimate from content resolver
+            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                inputStream.available().toLong()
+            } ?: 0L
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting file size", e)
+            0L
+        }
+    }
+
+    /**
+     * Tạo dữ liệu waveform từ file audio sử dụng FFmpeg để trích xuất PCM data
      */
     private fun generateWaveformData(uri: Uri, context: Context, sampleCount: Int): List<Float> {
-        try {
-            // Sử dụng MediaExtractor để trích xuất thông tin audio
-            val extractor = MediaExtractor()
-            val fd = context.contentResolver.openFileDescriptor(uri, "r")
-            fd?.use {
-                extractor.setDataSource(it.fileDescriptor)
-            } ?: return emptyList()
+        return try {
+            Log.d(TAG, "Generating waveform data using FFmpeg for $sampleCount samples")
 
-            // Tìm track audio
-            var audioTrackIndex = -1
-            for (i in 0 until extractor.trackCount) {
-                val format = extractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME)
-                if (mime?.startsWith("audio/") == true) {
-                    audioTrackIndex = i
-                    break
+            // Tạo thư mục tạm cho xử lý
+            val tempDir = File(context.cacheDir, "waveform_temp")
+            if (!tempDir.exists()) {
+                tempDir.mkdirs()
+            }
+
+            // Copy input file to temp directory
+            val inputFile = File(tempDir, "input_waveform.mp3")
+            val pcmFile = File(tempDir, "output_waveform.pcm")
+
+            try {
+                // Copy URI to local file
+                copyUriToFile(context, uri, inputFile)
+
+                // Sử dụng FFmpeg để chuyển đổi audio thành PCM 16-bit mono
+                val ffmpegCommand = "-y -i ${inputFile.absolutePath} " +
+                        "-f s16le " +        // 16-bit signed little endian PCM
+                        "-acodec pcm_s16le " + // PCM codec
+                        "-ac 1 " +           // Mono (1 channel)
+                        "-ar 44100 " +       // Sample rate 44.1kHz
+                        "${pcmFile.absolutePath}"
+
+                Log.d(TAG, "Executing FFmpeg command for waveform: $ffmpegCommand")
+
+                val session = FFmpegKit.execute(ffmpegCommand)
+                val returnCode = session.returnCode
+
+                if (!ReturnCode.isSuccess(returnCode)) {
+                    Log.e(TAG, "FFmpeg failed to generate PCM data: $returnCode")
+                    Log.e(TAG, "FFmpeg logs: ${session.allLogsAsString}")
+                    return generateFallbackWaveform(sampleCount)
                 }
-            }
 
-            if (audioTrackIndex == -1) {
-                return emptyList()
-            }
-
-            // Chọn track audio
-            extractor.selectTrack(audioTrackIndex)
-            
-            // Nếu không thể trích xuất qua MediaExtractor, tạo mẫu ngẫu nhiên để hiển thị
-            // Thực tế, cần triển khai trích xuất với FFmpeg cho độ chính xác cao
-            val samples = mutableListOf<Float>()
-            
-            // Lấy thời lượng audio - sử dụng runBlocking vì đang trong context non-suspend
-            val duration = runBlocking { 
-                getAudioDuration(uri, context) 
-            }.toFloat()
-            
-            val timePerSample = duration / sampleCount
-            
-            // Tạo các mẫu với khoảng cách đều
-            for (i in 0 until sampleCount) {
-                val timeStampMs = i * timePerSample
-                extractor.seekTo(timeStampMs.toLong() * 1000, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
-                
-                val buffer = ByteBuffer.allocate(1024)
-                val sampleSize = extractor.readSampleData(buffer, 0)
-                
-                if (sampleSize > 0) {
-                    // Tính toán biên độ từ dữ liệu mẫu
-                    var sum = 0f
-                    for (j in 0 until min(sampleSize, 1024) step 2) {
-                        if (j + 1 < sampleSize) {
-                            val low = buffer.get(j).toInt() and 0xFF
-                            val high = buffer.get(j + 1).toInt() and 0xFF
-                            val sample = (high shl 8) or low
-                            sum += abs(sample / 32768f)
-                        }
-                    }
-                    samples.add(max(0.1f, min(sum / (sampleSize / 2), 1.0f)))
-                } else {
-                    samples.add(0.1f) // Giá trị tối thiểu để vẫn hiển thị
+                if (!pcmFile.exists() || pcmFile.length() == 0L) {
+                    Log.e(TAG, "PCM file not created or is empty")
+                    return generateFallbackWaveform(sampleCount)
                 }
-                
-                extractor.advance()
+
+                Log.d(TAG, "PCM file generated successfully: ${pcmFile.length()} bytes")
+
+                // Đọc PCM data và tính toán amplitude
+                val waveformData = processRawPCMData(pcmFile, sampleCount)
+
+                generateAmplitudeList(pcmFile, sampleCount)
+
+                // Cleanup temp files
+                inputFile.delete()
+                pcmFile.delete()
+
+                Log.d(TAG, "Waveform generation completed with ${waveformData.size} samples")
+                return waveformData
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Error in waveform generation process", e)
+                // Cleanup on error
+                inputFile.delete()
+                pcmFile.delete()
+                return generateFallbackWaveform(sampleCount)
             }
-            
-            extractor.release()
-            
-            // Đảm bảo có đủ số lượng mẫu
-            while (samples.size < sampleCount) {
-                samples.add(0.1f)
-            }
-            
-            return samples
-            
+
         } catch (e: Exception) {
-            Log.e(TAG, "Error generating waveform data", e)
-            // Trả về dữ liệu mẫu giả nếu có lỗi
-            return List(sampleCount) { 0.1f + Math.random().toFloat() * 0.8f }
+            Log.e(TAG, "Error generating waveform data with FFmpeg", e)
+            return generateFallbackWaveform(sampleCount)
+        }
+    }
+
+    /**
+     * Tạo amplitude list tương tự thư viện Amplituda
+     * Trả về List<Int> với các giá trị amplitude được normalize từ 0-100
+     * Sử dụng stream processing để tránh OutOfMemoryError với file lớn
+     */
+    private fun generateAmplitudeList(pcmFile: File, sampleCount: Int) {
+        try {
+            if (!pcmFile.exists() || pcmFile.length() == 0L) {
+                Log.w(TAG, "PCM file is empty or doesn't exist, using fallback amplitude")
+                setFallbackAmplitude(sampleCount)
+                return
+            }
+
+            Log.d(TAG, "Processing PCM file with stream: ${pcmFile.length()} bytes")
+            
+            // Sử dụng stream processing thay vì đọc toàn bộ file
+            val amplitudeList = processAmplitudesWithStream(pcmFile, sampleCount)
+            
+            Log.d(TAG, "Generated amplitude list with ${amplitudeList.size} values")
+            Log.d(TAG, "Amplitude range: ${amplitudeList.minOrNull()} - ${amplitudeList.maxOrNull()}")
+
+            // Cập nhật state với amplitude data
+            _state.value = _state.value.copy(
+                amplitude = amplitudeList,
+            )
+            _state.value.audioInfo = _state.value.audioInfo?.copy(
+                amplitudeInt = amplitudeList
+            )
+            Log.d(TAG, "Amplitude data updated: ${state.value.audioInfo?.amplitudeInt}")
+            Log.d(TAG, "Amplitude data updated: ${state.value.amplitude}")
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error generating amplitude list", e)
+            setFallbackAmplitude(sampleCount)
+        }
+    }
+
+    /**
+     * Xử lý amplitude với stream processing để tránh OutOfMemoryError
+     * Đọc file PCM theo chunk nhỏ thay vì load toàn bộ vào memory
+     */
+    private fun processAmplitudesWithStream(pcmFile: File, targetCount: Int): List<Int> {
+        // Chọn buffer size phù hợp với kích thước file
+        val chunkSize = if (pcmFile.length() > LARGE_FILE_SIZE_THRESHOLD) {
+            BUFFER_SIZE_LARGE
+        } else {
+            BUFFER_SIZE_SMALL
+        }
+        
+        val totalBytes = pcmFile.length()
+        val totalSamples = (totalBytes / 2).toInt() // 16-bit = 2 bytes per sample
+        
+        if (totalSamples == 0) {
+            return List(targetCount) { 0 }
+        }
+
+        val samplesPerBucket = maxOf(1, totalSamples / targetCount)
+        val amplitudes = mutableListOf<Int>()
+        
+        Log.d(TAG, "Stream processing: $totalBytes bytes, $totalSamples samples, $samplesPerBucket samples per bucket, chunk size: $chunkSize")
+        
+        try {
+            pcmFile.inputStream().buffered(chunkSize).use { inputStream ->
+                val buffer = ByteArray(chunkSize)
+                var bytesRead: Int
+                var totalSamplesProcessed = 0
+                var currentBucket = 0
+                var currentBucketPeak = 0
+                var samplesInCurrentBucket = 0
+                
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    // Xử lý từng chunk
+                    var i = 0
+                    while (i < bytesRead - 1) {
+                        // Đọc 16-bit signed sample (little endian)
+                        val low = buffer[i].toInt() and 0xFF
+                        val high = buffer[i + 1].toInt()
+                        var sample = (high shl 8) or low
+                        if (sample > 32767) {
+                            sample -= 65536
+                        }
+                        
+                        // Cập nhật peak cho bucket hiện tại
+                        val absSample = abs(sample)
+                        if (absSample > currentBucketPeak) {
+                            currentBucketPeak = absSample
+            }
+                        
+                        samplesInCurrentBucket++
+                        totalSamplesProcessed++
+                        
+                        // Kiểm tra xem có hoàn thành bucket hiện tại không
+                        if (samplesInCurrentBucket >= samplesPerBucket || totalSamplesProcessed >= totalSamples) {
+            // Normalize peak về 0-100
+                            val normalized = ((currentBucketPeak / 32767.0) * 100).toInt().coerceIn(0, 100)
+            amplitudes.add(normalized)
+                            
+                            // Reset cho bucket tiếp theo
+                            currentBucket++
+                            currentBucketPeak = 0
+                            samplesInCurrentBucket = 0
+                            
+                            // Nếu đã có đủ buckets, thoát
+                            if (currentBucket >= targetCount) {
+                                break
+                            }
+                        }
+                        
+                        i += 2
+                    }
+                    
+                    // Nếu đã xử lý đủ samples, thoát
+                    if (currentBucket >= targetCount) {
+                        break
+                    }
+                    
+                    // Gợi ý garbage collection mỗi 100 iterations để giải phóng memory
+                    if (totalSamplesProcessed % 100000 == 0) {
+                        System.gc()
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error in stream processing", e)
+            return List(targetCount) { 0 }
+        }
+        
+        // Đảm bảo có đủ số lượng amplitudes
+        while (amplitudes.size < targetCount) {
+            amplitudes.add(0)
+        }
+        
+        // Cleanup và gợi ý garbage collection
+        System.gc()
+        
+        return amplitudes
+    }
+
+    /**
+     * Tạo amplitude data fallback khi không thể xử lý file
+     */
+    private fun setFallbackAmplitude(sampleCount: Int) {
+        val fallbackAmplitudes = List(sampleCount) {
+            // Tạo pattern giống waveform thực với random variations
+            val baseAmplitude = (kotlin.math.sin(it.toDouble() / sampleCount * 4 * Math.PI) * 30).toInt()
+            val randomVariation = (-5..5).random()
+            (baseAmplitude + randomVariation).coerceIn(0, 50)
+        }
+
+        _state.value = _state.value.copy(
+            amplitude = fallbackAmplitudes,
+        )
+        _state.value.audioInfo = _state.value.audioInfo?.copy(
+            amplitudeInt = fallbackAmplitudes
+        )
+    }
+
+    /**
+     * Xử lý dữ liệu PCM thô để tạo ra waveform amplitude values
+     * Sử dụng stream processing để tránh OutOfMemoryError
+     */
+    private fun processRawPCMData(pcmFile: File, sampleCount: Int): List<Float> {
+        try {
+            if (!pcmFile.exists() || pcmFile.length() == 0L) {
+                return generateFallbackWaveform(sampleCount)
+            }
+
+            val totalBytes = pcmFile.length()
+            val totalSamples = (totalBytes / 2).toInt() // 16-bit = 2 bytes per sample
+            if (totalSamples == 0) {
+                return generateFallbackWaveform(sampleCount)
+            }
+
+            val samplesPerBucket = maxOf(1, totalSamples / sampleCount)
+            val waveformData = mutableListOf<Float>()
+
+            // Chọn buffer size phù hợp với kích thước file
+            val chunkSize = if (pcmFile.length() > LARGE_FILE_SIZE_THRESHOLD) {
+                BUFFER_SIZE_LARGE
+            } else {
+                BUFFER_SIZE_SMALL
+            }
+
+            Log.d(TAG, "Processing PCM data with stream: $totalBytes bytes, $totalSamples samples, chunk size: $chunkSize")
+            Log.d(TAG, "Samples per bucket: $samplesPerBucket")
+
+            pcmFile.inputStream().buffered(chunkSize).use { inputStream ->
+                val buffer = ByteArray(chunkSize)
+                var bytesRead: Int
+                var totalSamplesProcessed = 0
+                var currentBucket = 0
+                var maxAmplitude = 0f
+                var samplesInCurrentBucket = 0
+                
+                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    var i = 0
+                    while (i < bytesRead - 1) {
+                        // Đọc 16-bit signed sample (little endian)
+                        val low = buffer[i].toInt() and 0xFF
+                        val high = buffer[i + 1].toInt()
+                        var sample = (high shl 8) or low
+
+                        // Chuyển đổi từ signed 16-bit về float (-1.0 to 1.0)
+                        val normalizedSample = if (sample > 32767) {
+                            (sample - 65536) / 32768f
+                        } else {
+                            sample / 32768f
+                        }
+
+                        // Cập nhật amplitude lớn nhất trong bucket hiện tại
+                        maxAmplitude = maxOf(maxAmplitude, abs(normalizedSample))
+
+                        samplesInCurrentBucket++
+                        totalSamplesProcessed++
+                        
+                        // Kiểm tra xem có hoàn thành bucket hiện tại không
+                        if (samplesInCurrentBucket >= samplesPerBucket || totalSamplesProcessed >= totalSamples) {
+                // Đảm bảo giá trị nằm trong khoảng [0.1, 1.0] để hiển thị tốt
+                val clampedAmplitude = maxOf(0.1f, minOf(1.0f, maxAmplitude))
+                waveformData.add(clampedAmplitude)
+                            
+                            // Reset cho bucket tiếp theo
+                            currentBucket++
+                            maxAmplitude = 0f
+                            samplesInCurrentBucket = 0
+                            
+                            // Nếu đã có đủ buckets, thoát
+                            if (currentBucket >= sampleCount) {
+                                break
+                            }
+                        }
+                        
+                        i += 2
+                    }
+                    
+                    // Nếu đã xử lý đủ samples, thoát
+                    if (currentBucket >= sampleCount) {
+                        break
+                    }
+                    
+                    // Gợi ý garbage collection mỗi 100k samples để giải phóng memory
+                    if (totalSamplesProcessed % 100000 == 0) {
+                        System.gc()
+                    }
+                }
+            }
+
+            // Đảm bảo có đủ số lượng mẫu
+            while (waveformData.size < sampleCount) {
+                waveformData.add(0.1f)
+            }
+
+            // Cleanup và gợi ý garbage collection
+            System.gc()
+
+            Log.d(TAG, "Waveform processing completed: ${waveformData.size} amplitude values")
+            return waveformData
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error processing PCM data with stream", e)
+            return generateFallbackWaveform(sampleCount)
+        }
+    }
+
+    /**
+     * Tạo waveform fallback khi không thể xử lý audio
+     */
+    private fun generateFallbackWaveform(sampleCount: Int): List<Float> {
+        Log.w(TAG, "Using fallback waveform generation")
+        return List(sampleCount) {
+            // Tạo waveform giả với pattern hình sin để trông tự nhiên hơn
+            val x = it.toFloat() / sampleCount * 4 * Math.PI
+            0.3f + 0.4f * kotlin.math.sin(x).toFloat() * kotlin.math.abs(kotlin.math.sin(x * 0.5))
+                .toFloat()
         }
     }
 
     fun setTimeRange(startMs: Float, endMs: Float) {
+        val audioInfo = _state.value.audioInfo ?: return
+
         val validStartMs = startMs.coerceAtLeast(0f)
-        val validEndMs = endMs.coerceAtMost(_state.value.audioDuration.toFloat())
+        val validEndMs = endMs.coerceAtMost(audioInfo.duration)
             .coerceAtLeast(validStartMs + 1000) // Đảm bảo khoảng thời gian tối thiểu 1 giây
-        
+
+        // Cập nhật AudioFileInfo
+        audioInfo.startTime = validStartMs
+        audioInfo.endTime = validEndMs
+
+        // Cập nhật state với AudioFileInfo đã được cập nhật
         _state.value = _state.value.copy(
-            startTimeMs = validStartMs,
-            endTimeMs = validEndMs,
-            startTime = formatMillisecondsToTimeString(validStartMs.toLong()),
-            endTime = formatMillisecondsToTimeString(validEndMs.toLong())
+            audioInfo = audioInfo
         )
     }
 
-    private suspend fun getAudioDuration(uri: Uri, context: Context): Int {
+    private suspend fun getAudioDuration(uri: Uri, context: Context): Float {
         return withContext(Dispatchers.IO) {
             try {
                 val retriever = MediaMetadataRetriever()
@@ -200,11 +561,39 @@ class TrimAudioViewModel : ViewModel() {
                 val durationStr =
                     retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 retriever.release()
-                (durationStr?.toLongOrNull() ?: 30000L).toInt()
+                (durationStr?.toLongOrNull() ?: 30000L).toFloat()
             } catch (e: Exception) {
                 Log.e(TAG, "Error getting audio duration", e)
-                30000 // Default to 30 seconds if unable to determine
+                30000f // Default to 30 seconds if unable to determine
             }
+        }
+    }
+
+    private fun getFileNameFromUri(uri: Uri, context: Context): String {
+        Log.d(TAG, "getFileNameFromUri: $uri")
+        return try {
+            val cursor = context.contentResolver.query(uri, null, null, null, null)
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val displayNameIndex = it.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    if (displayNameIndex != -1) {
+                        return it.getString(displayNameIndex) ?: "Unknown Audio"
+                    }
+                }
+            }
+
+            // Fallback: try to get filename from URI path
+            val path = uri.path
+            if (path != null) {
+                val lastSlash = path.lastIndexOf('/')
+                if (lastSlash != -1 && lastSlash < path.length - 1) {
+                    return path.substring(lastSlash + 1)
+                }
+            }
+            "Unknown Audio"
+        } catch (e: Exception) {
+            Log.e(TAG, "Error getting file name from URI", e)
+            "Unknown Audio"
         }
     }
 
@@ -216,63 +605,78 @@ class TrimAudioViewModel : ViewModel() {
     }
 
     fun setStartTime(time: String) {
+        val audioInfo = _state.value.audioInfo ?: return
         val cleanTime = formatTime(time)
-        
+
         // Update milliseconds value
         val startSeconds = timeToSeconds(cleanTime)
         val startMs = startSeconds * 1000f
 
         // Đảm bảo end time luôn lớn hơn start time ít nhất 1 giây
-        val currentEndMs = _state.value.endTimeMs
+        val currentEndMs = audioInfo.endTime
         val validStartMs = startMs.coerceAtMost(currentEndMs - 1000)
-        
+
+        // Cập nhật AudioFileInfo
+        audioInfo.startTime = validStartMs
+
+        // Cập nhật state với AudioFileInfo đã được cập nhật
         _state.value = _state.value.copy(
-            startTime = formatMillisecondsToTimeString(validStartMs.toLong()),
-            startTimeMs = validStartMs
+            audioInfo = audioInfo
         )
     }
 
     fun setEndTime(time: String) {
+        val audioInfo = _state.value.audioInfo ?: return
         val cleanTime = formatTime(time)
-        
+
         // Update milliseconds value
         val endSeconds = timeToSeconds(cleanTime)
         val endMs = endSeconds * 1000f
 
         // Đảm bảo end time luôn lớn hơn start time ít nhất 1 giây
-        val currentStartMs = _state.value.startTimeMs
-        val maxAllowedEndMs = _state.value.audioDuration.toFloat()
+        val currentStartMs = audioInfo.startTime
+        val maxAllowedEndMs = audioInfo.duration
         val validEndMs = endMs.coerceAtLeast(currentStartMs + 1000).coerceAtMost(maxAllowedEndMs)
-        
+
+        // Cập nhật AudioFileInfo
+        audioInfo.endTime = validEndMs
+
+        // Cập nhật state với AudioFileInfo đã được cập nhật
         _state.value = _state.value.copy(
-            endTime = formatMillisecondsToTimeString(validEndMs.toLong()),
-            endTimeMs = validEndMs
+            audioInfo = audioInfo
         )
     }
 
     fun playAudioPreview(context: Context) {
-        stopPlayback()
-
-        val audioUri = _state.value.audioPath ?: return
-        val startMs = _state.value.startTimeMs.toLong()
+        val audioInfo = _state.value.audioInfo ?: return
+        val audioUri = audioInfo.audioPath ?: return
+        
+        // Sử dụng vị trí pause trước đó hoặc start time
+        val resumePosition = if (_state.value.currentPlayAudioPosition > audioInfo.startTime) {
+            _state.value.currentPlayAudioPosition.toLong()
+        } else {
+            audioInfo.startTime.toLong()
+        }
 
         try {
             mediaPlayer = MediaPlayer().apply {
                 setDataSource(context, audioUri)
                 prepare()
-                // Sửa lỗi trên một số phiên bản Android cũ hơn 23 (M)
+                
+                // Seek đến vị trí resume
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    seekTo(startMs, MediaPlayer.SEEK_NEXT_SYNC)
+                    seekTo(resumePosition, MediaPlayer.SEEK_NEXT_SYNC)
                 } else {
-                    seekTo(startMs.toInt())
+                    seekTo(resumePosition.toInt())
                 }
 
                 setOnCompletionListener {
                     _state.value = _state.value.copy(
                         isPlaying = false,
-                        currentPlaybackPosition = _state.value.startTimeMs
+                        currentPlaybackPosition = audioInfo.startTime,
+                        currentPlayAudioPosition = audioInfo.startTime // Reset vị trí khi hoàn thành
                     )
-                    stopPlayback()
+                    stopMediaPlayback()
                 }
 
                 start()
@@ -280,9 +684,11 @@ class TrimAudioViewModel : ViewModel() {
 
             _state.value = _state.value.copy(
                 isPlaying = true,
-                currentPlaybackPosition = startMs.toFloat()
+                currentPlaybackPosition = resumePosition.toFloat()
             )
 
+            Log.d(TAG, "Audio playback resumed from position: ${resumePosition}ms")
+            
             // Start updating progress
             startProgressUpdate()
         } catch (e: Exception) {
@@ -294,9 +700,11 @@ class TrimAudioViewModel : ViewModel() {
     private fun startProgressUpdate() {
         progressUpdateJob?.cancel()
         progressUpdateJob = viewModelScope.launch(Dispatchers.IO) {
-            val endTimeMs = _state.value.endTimeMs
+            val audioInfo = _state.value.audioInfo ?: return@launch
+            val endTimeMs = audioInfo.endTime
+            val startTimeMs = audioInfo.startTime
             val updateInterval = 50L // Giảm xuống 50ms để phản hồi nhanh hơn
-            
+
             while (_state.value.isPlaying && mediaPlayer != null) {
                 try {
                     val position = mediaPlayer?.currentPosition?.toFloat() ?: 0f
@@ -304,9 +712,9 @@ class TrimAudioViewModel : ViewModel() {
                     // Check if we've reached the end position
                     if (position >= endTimeMs) {
                         withContext(Dispatchers.Main) {
-                            stopPlayback()
+                            stopMediaPlayback()
                             _state.value = _state.value.copy(
-                                currentPlaybackPosition = _state.value.startTimeMs
+                                currentPlaybackPosition = startTimeMs
                             )
                         }
                         break
@@ -314,8 +722,7 @@ class TrimAudioViewModel : ViewModel() {
 
                     _state.value = _state.value.copy(
                         currentPlaybackPosition = position,
-                        playerProgress = (position - _state.value.startTimeMs) /
-                                (endTimeMs - _state.value.startTimeMs)
+                        playerProgress = (position - startTimeMs) / (endTimeMs - startTimeMs)
                     )
 
                     kotlinx.coroutines.delay(updateInterval)
@@ -327,7 +734,34 @@ class TrimAudioViewModel : ViewModel() {
         }
     }
 
-    fun stopPlayback() {
+    fun pauseAudioPlayback() {
+        mediaPlayer?.let { player ->
+            try {
+                if (player.isPlaying) {
+                    val currentPosition = player.currentPosition.toFloat()
+                    player.pause()
+                    
+                    // Lưu vị trí hiện tại để resume sau
+                    _state.value = _state.value.copy(
+                        isPlaying = false,
+                        currentPlayAudioPosition = currentPosition,
+                        currentPlaybackPosition = currentPosition
+                    )
+                    
+                    Log.d(TAG, "Audio paused at position: ${currentPosition}ms")
+                    
+                    // Stop progress update
+                    progressUpdateJob?.cancel()
+                } else {
+
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error pausing audio", e)
+            }
+        }
+    }
+
+    fun stopMediaPlayback() {
         mediaPlayer?.apply {
             try {
                 if (isPlaying) {
@@ -340,12 +774,19 @@ class TrimAudioViewModel : ViewModel() {
         }
         mediaPlayer = null
         progressUpdateJob?.cancel()
-        _state.value = _state.value.copy(isPlaying = false)
+        
+        // Reset về start time khi stop hoàn toàn
+        val audioInfo = _state.value.audioInfo
+        _state.value = _state.value.copy(
+            isPlaying = false,
+            currentPlaybackPosition = audioInfo?.startTime ?: 0f,
+            currentPlayAudioPosition = audioInfo?.startTime ?: 0f
+        )
     }
 
     override fun onCleared() {
         super.onCleared()
-        stopPlayback()
+        stopMediaPlayback()
     }
 
     fun clearError() {
@@ -354,13 +795,15 @@ class TrimAudioViewModel : ViewModel() {
 
     fun trimAudio(context: Context) {
         val currentState = _state.value
-        if (currentState.audioPath == null) {
+        val audioInfo = currentState.audioInfo
+
+        if (audioInfo == null || audioInfo.audioPath == null) {
             _state.value = currentState.copy(error = "Vui lòng chọn file audio")
             return
         }
 
-        val startMs = currentState.startTimeMs
-        val endMs = currentState.endTimeMs
+        val startMs = audioInfo.startTime
+        val endMs = audioInfo.endTime
 
         if (endMs <= startMs) {
             _state.value =
@@ -382,7 +825,7 @@ class TrimAudioViewModel : ViewModel() {
 
                 val (outputPath, outputUri) = trimAudioFile(
                     context,
-                    currentState.audioPath,
+                    audioInfo.audioPath,
                     startTime,
                     endTime
                 )
@@ -667,7 +1110,7 @@ class TrimAudioViewModel : ViewModel() {
                 } catch (cleanupEx: Exception) {
                     Log.e(TAG, "Error during cleanup of temp files", cleanupEx)
                 }
-                
+
                 withContext(Dispatchers.Main) {
                     _state.value = _state.value.copy(
                         isProcessing = false,
@@ -805,7 +1248,7 @@ class TrimAudioViewModel : ViewModel() {
     }
 
     fun resetState() {
-        stopPlayback()
+        stopMediaPlayback()
         _state.value = AudioTrimState()
     }
 } 

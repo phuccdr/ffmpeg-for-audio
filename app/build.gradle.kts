@@ -77,7 +77,8 @@ dependencies {
     //lifecycle for compose
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.6.0")
 
-    implementation ("com.github.lincollincol:compose-audiowaveform:1.1.1")
-    implementation ("com.github.lincollincol:amplituda:2.3.0")
+   // implementation ("com.github.lincollincol:compose-audiowaveform:1.1.1")
+    // Amplituda
+   // implementation ("com.github.lincollincol:amplituda:2.3.0")
 
 }
